@@ -1,6 +1,8 @@
 name: Build Windows binary
 on:
    workflow_dispatch:
+   push:
+      branches: [vng-otel]
 
 jobs:
    build:
