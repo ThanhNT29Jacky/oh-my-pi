@@ -1,0 +1,25 @@
+name: Build Windows binary
+on:
+   workflow_dispatch:
+
+jobs:
+   build:
+      runs-on: windows-2025
+      steps:
+         - uses: actions/checkout@v4
+         - uses: oven-sh/setup-bun@v2
+         - uses: dtolnay/rust-toolchain@stable
+         - run: bun install --frozen-lockfile
+         - name: Build native addon (host)
+           run: bun run build:native
+         - name: Build binary
+           working-directory: packages/coding-agent
+           run: bun run build
+         - name: Locate binary
+           shell: bash
+           run: find packages/coding-agent -name "*.exe" -not -path "*/node_modules/*"
+         - uses: actions/upload-artifact@v4
+           with:
+              name: omp-vng-windows-x64
+              path: packages/coding-agent/binaries/*.exe
+              if-no-files-found: error

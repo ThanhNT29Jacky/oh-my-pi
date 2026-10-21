@@ -8,9 +8,12 @@
 - Added `/forget-approvals` to forget every file and folder approval Ask and remember has recorded ([#16049](https://github.com/can1357/oh-my-pi/pull/16049) by [@Peribunt](https://github.com/Peribunt))
 - Extension `ui.approve()` hosts can render the new `prompt.grants` choices and answer `{ grant, always }`; hosts that ignore them keep answering `once`/`session`/`deny` ([#16049](https://github.com/can1357/oh-my-pi/pull/16049) by [@Peribunt](https://github.com/Peribunt))
 - Extension and custom tools can declare `approvalCacheTargets` to take part in Ask and remember grants ([#16049](https://github.com/can1357/oh-my-pi/pull/16049) by [@Peribunt](https://github.com/Peribunt))
+- Added `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` (also per signal) alongside `http/protobuf`, so OTLP export reaches collectors that only accept JSON, as Claude Code sends
+- Added `OMP_OTEL_CLAUDE_CODE_COMPAT=1`: OTLP export then follows Claude Code's schema (`service.name=claude-code`, `claude_code.*` metrics and `user_prompt`/`api_request`/`tool_result` events, with the signed-in Claude account identity, Anthropic provider only), so collectors and dashboards built for Claude Code also show omp
 
 ### Fixed
 
+- Fixed a collector that rejects OTLP exports (for example `401 Unauthorized`) aborting print mode's failure flush and surfacing as an uncaught exception; export flush and shutdown failures are now logged as warnings
 - Fixed `find`, `glob` and `ast_grep` always refusing `ssh://` paths with "ssh:// access needs exec approval; this command was approved at read": they now ask for `exec` approval like `read` and `grep` do ([#16285](https://github.com/can1357/oh-my-pi/pull/16285) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed a `conflict://*` write of per-id lines with literal values (`1: foo`, `2: bar`) writing all of them into every conflict block and reporting success; it now fails without touching the file and points to per-block `conflict://<N>` writes ([#16267](https://github.com/can1357/oh-my-pi/pull/16267) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed hashline block edits (`PUT N*:`, `CUT N*`) applying over block lines a `read` never fully showed, such as a line cut at the column cap, which silently dropped that line's tail; they are now rejected like the equivalent explicit range ([#16209](https://github.com/can1357/oh-my-pi/issues/16209))

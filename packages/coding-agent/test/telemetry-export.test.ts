@@ -74,10 +74,6 @@ describe("initTelemetryExport gating", () => {
 		process.env.OTEL_EXPORTER_OTLP_PROTOCOL = "grpc";
 		await initTelemetryExport(true);
 		expect(isTelemetryExportEnabled()).toBe(false);
-
-		process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = "http/json";
-		await initTelemetryExport(true);
-		expect(isTelemetryExportEnabled()).toBe(false);
 	});
 
 	it("honors the kill-switches case-insensitively per the OTEL env contract", async () => {
@@ -132,6 +128,9 @@ describe("initTelemetryExport signals export path", () => {
 			["traces", "./otel-export-probe.ts"],
 			["logs and metrics", "./otel-signals-probe.ts"],
 			["resource attributes", "./otel-resource-probe.ts"],
+			["http/json transport", "./otel-json-probe.ts"],
+			["rejecting collector", "./otel-reject-probe.ts"],
+			["claude code compat", "./otel-claude-compat-probe.ts"],
 		] as const;
 		const results = await Promise.all(
 			probes.map(async ([name, relativePath]) => {
@@ -152,6 +151,9 @@ describe("initTelemetryExport signals export path", () => {
 			traces: 0,
 			"logs and metrics": 0,
 			"resource attributes": 0,
+			"http/json transport": 0,
+			"rejecting collector": 0,
+			"claude code compat": 0,
 		});
 	}, 20_000);
 });

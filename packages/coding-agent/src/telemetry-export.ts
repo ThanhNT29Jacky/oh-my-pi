@@ -9,9 +9,9 @@
  * loads `./telemetry-export-otlp` to register the trace/log/metric providers —
  * keeping the OTel SDK + exporter module graph (~100ms) out of default startup.
  *
- * Only the `http/protobuf` transport is supported — an
- * `OTEL_EXPORTER_OTLP*_PROTOCOL` of `grpc` or `http/json` declines rather than
- * misrouting protobuf payloads.
+ * `http/protobuf` (default) and `http/json` are supported per signal; any other
+ * `OTEL_EXPORTER_OTLP*_PROTOCOL` (e.g. `grpc`) declines the signal rather than
+ * misrouting payloads.
  */
 import type { AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -19,11 +19,17 @@ import { logger } from "@oh-my-pi/pi-utils";
 /** Whether the model registered under a provider id and requested model id has known pricing. */
 export type TelemetryModelPricingResolver = (providerId: string, modelId: string) => boolean;
 
-/** Per-signal OTLP export toggles resolved from the `OTEL_*` env contract. */
+/** OTLP wire format a signal exports with. */
+export type OtlpProtocol = "http/protobuf" | "http/json";
+
+/**
+ * Per-signal OTLP export protocol resolved from the `OTEL_*` env contract;
+ * `undefined` means the signal is not exported.
+ */
 export interface TelemetrySignalConfig {
-	readonly trace: boolean;
-	readonly log: boolean;
-	readonly metric: boolean;
+	readonly trace: OtlpProtocol | undefined;
+	readonly log: OtlpProtocol | undefined;
+	readonly metric: OtlpProtocol | undefined;
 }
 
 type TelemetrySignal = "trace" | "log" | "metric";
@@ -104,19 +110,19 @@ export async function flushTelemetryExport(): Promise<void> {
 
 function resolveSignalConfig(): TelemetrySignalConfig {
 	return {
-		trace: signalEnabled(
+		trace: signalProtocol(
 			"trace",
 			process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
 			process.env.OTEL_TRACES_EXPORTER,
 			process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL ?? process.env.OTEL_EXPORTER_OTLP_PROTOCOL,
 		),
-		log: signalEnabled(
+		log: signalProtocol(
 			"log",
 			process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
 			process.env.OTEL_LOGS_EXPORTER,
 			process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL ?? process.env.OTEL_EXPORTER_OTLP_PROTOCOL,
 		),
-		metric: signalEnabled(
+		metric: signalProtocol(
 			"metric",
 			process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
 			process.env.OTEL_METRICS_EXPORTER,
@@ -125,12 +131,12 @@ function resolveSignalConfig(): TelemetrySignalConfig {
 	};
 }
 
-function signalEnabled(
+function signalProtocol(
 	signal: TelemetrySignal,
 	endpoint: string | undefined,
 	exporterSelection: string | undefined,
 	protocolSelection: string | undefined,
-): boolean {
+): OtlpProtocol | undefined {
 	if (exporterSelection) {
 		let hasSelection = false;
 		let hasOtlp = false;
@@ -138,19 +144,20 @@ function signalEnabled(
 			const selection = entry.trim().toLowerCase();
 			if (!selection) continue;
 			hasSelection = true;
-			if (selection === "none") return false;
+			if (selection === "none") return undefined;
 			if (selection === "otlp") hasOtlp = true;
 		}
-		if (hasSelection && !hasOtlp) return false;
+		if (hasSelection && !hasOtlp) return undefined;
 	}
-	if (!endpoint) return false;
+	if (!endpoint) return undefined;
 
-	const protocol = protocolSelection?.trim().toLowerCase();
-	if (protocol && protocol !== "http/protobuf") {
+	// Spec default for an unset protocol is http/protobuf.
+	const protocol = protocolSelection?.trim().toLowerCase() || "http/protobuf";
+	if (protocol !== "http/protobuf" && protocol !== "http/json") {
 		logger.warn(`OTEL ${signal} export disabled: OTEL_EXPORTER_OTLP_PROTOCOL=${protocol} is unsupported`, {
-			supported: "http/protobuf",
+			supported: "http/protobuf, http/json",
 		});
-		return false;
+		return undefined;
 	}
-	return true;
+	return protocol;
 }

@@ -5,11 +5,11 @@
  * configured — the OTel SDK + OTLP exporter graph costs ~100ms of module
  * evaluation, so it must stay out of default CLI startup.
  *
- * Only the `http/protobuf` transport is supported — an
- * `OTEL_EXPORTER_OTLP*_PROTOCOL` of `grpc` or `http/json` declines rather than
- * misrouting protobuf payloads. The exporter line is pinned to the 0.218/2.7
- * family validated under Bun; the 1.x OTLP line deadlocks when its
- * `req.on("close")` handler fires after a successful export.
+ * `http/protobuf` and `http/json` are supported, chosen per signal; any other
+ * `OTEL_EXPORTER_OTLP*_PROTOCOL` (e.g. `grpc`) is declined upstream. The
+ * exporter line is pinned to the 0.218/2.7 family validated under Bun; the 1.x
+ * OTLP line deadlocks when its `req.on("close")` handler fires after a
+ * successful export.
  */
 import type {
 	AgentRunCoverage,
@@ -33,14 +33,18 @@ import {
 } from "@opentelemetry/api";
 import { type LogAttributes, logs, type Logger as OtelLogger, SeverityNumber } from "@opentelemetry/api-logs";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
-import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
-import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { OTLPLogExporter as OTLPLogExporterJson } from "@opentelemetry/exporter-logs-otlp-http";
+import { OTLPLogExporter as OTLPLogExporterProto } from "@opentelemetry/exporter-logs-otlp-proto";
+import { OTLPMetricExporter as OTLPMetricExporterJson } from "@opentelemetry/exporter-metrics-otlp-http";
+import { OTLPMetricExporter as OTLPMetricExporterProto } from "@opentelemetry/exporter-metrics-otlp-proto";
+import { OTLPTraceExporter as OTLPTraceExporterJson } from "@opentelemetry/exporter-trace-otlp-http";
+import { OTLPTraceExporter as OTLPTraceExporterProto } from "@opentelemetry/exporter-trace-otlp-proto";
 import { detectResources, envDetector, resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
 import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { ClaudeCodeCompatRecorder, isClaudeCodeCompatEnabled } from "./telemetry-claude-compat";
 import type { TelemetryModelPricingResolver, TelemetrySignalConfig } from "./telemetry-export";
 
 /**
@@ -74,6 +78,7 @@ let traceProvider: NodeTracerProvider | undefined;
 let logProvider: LoggerProvider | undefined;
 let meterProvider: MeterProvider | undefined;
 let metricRecorder: AgentMetricRecorder | undefined;
+let compatRecorder: ClaudeCodeCompatRecorder | undefined;
 let otelLogger: OtelLogger | undefined;
 let unregisterLogSink: (() => void) | undefined;
 
@@ -133,15 +138,25 @@ export function createTelemetryExportConfig(
 		onChatUsage: async event => {
 			await config?.onChatUsage?.(event);
 			metricRecorder?.recordChatUsage(event);
+			compatRecorder?.recordChatUsage(event);
+		},
+		onSpanStart: ctx => {
+			config?.onSpanStart?.(ctx);
+			compatRecorder?.onSpanStart(ctx);
+		},
+		onSpanEnd: ctx => {
+			config?.onSpanEnd?.(ctx);
+			compatRecorder?.onSpanEnd(ctx);
 		},
 		onRunEnd: (summary, coverage) => {
 			config?.onRunEnd?.(summary, coverage);
 			metricRecorder?.recordRun(summary, coverage);
-			emitRunSummaryLog(summary, coverage);
+			compatRecorder?.recordRun(summary);
+			if (!compatRecorder) emitRunSummaryLog(summary, coverage);
 		},
 		onTelemetryWarning: warning => {
 			config?.onTelemetryWarning?.(warning);
-			emitTelemetryWarningLog(warning);
+			if (!compatRecorder) emitTelemetryWarningLog(warning);
 		},
 	};
 }
@@ -152,12 +167,18 @@ export async function registerProviders(signalConfig: TelemetrySignalConfig): Pr
 	// OTEL_SERVICE_NAME; merged last so both take precedence over the fallback
 	// service.name — with OTEL_SERVICE_NAME still winning service.name inside the
 	// detector itself.
-	const resource = resourceFromAttributes({ "service.name": SERVICE_NAME }).merge(
+	const claudeCompat = isClaudeCodeCompatEnabled();
+	const resource = resourceFromAttributes({ "service.name": claudeCompat ? "claude-code" : SERVICE_NAME }).merge(
 		detectResources({ detectors: [envDetector] }),
 	);
 
-	if (signalConfig.trace) {
-		const exporter = new OTLPTraceExporter();
+	if (claudeCompat) {
+		// Claude Code exports no traces. Spans still need a real SDK provider, without an
+		// exporter, so the compat hooks can read tool status and parentage from them.
+		traceProvider = new NodeTracerProvider({ resource });
+		traceProvider.register({ contextManager: new AsyncLocalStorageContextManager().enable() });
+	} else if (signalConfig.trace) {
+		const exporter = signalConfig.trace === "http/json" ? new OTLPTraceExporterJson() : new OTLPTraceExporterProto();
 		traceProvider = new NodeTracerProvider({
 			resource,
 			spanProcessors: [new BatchSpanProcessor(exporter)],
@@ -166,26 +187,37 @@ export async function registerProviders(signalConfig: TelemetrySignalConfig): Pr
 	}
 
 	if (signalConfig.metric) {
-		const exporter = new OTLPMetricExporter();
+		const exporter =
+			signalConfig.metric === "http/json" ? new OTLPMetricExporterJson() : new OTLPMetricExporterProto();
 		meterProvider = new MeterProvider({
 			resource,
 			readers: [new PeriodicExportingMetricReader({ exporter })],
 		});
 		metrics.setGlobalMeterProvider(meterProvider);
-		metricRecorder = new AgentMetricRecorder(metrics.getMeter("@oh-my-pi/pi-coding-agent"));
+		if (!claudeCompat) metricRecorder = new AgentMetricRecorder(metrics.getMeter("@oh-my-pi/pi-coding-agent"));
 	}
 
 	if (signalConfig.log) {
-		const exporter = new OTLPLogExporter();
+		const exporter = signalConfig.log === "http/json" ? new OTLPLogExporterJson() : new OTLPLogExporterProto();
 		logProvider = new LoggerProvider({
 			resource,
 			processors: [new BatchLogRecordProcessor({ exporter })],
 		});
 		logs.setGlobalLoggerProvider(logProvider);
 		otelLogger = logProvider.getLogger("@oh-my-pi/pi-coding-agent");
-		unregisterLogSink = logger.registerLogSink(event => {
-			emitOtelLog(event.level, event.message, logAttributesFromContext(event.context), "omp.log", event.timestamp);
-		});
+		// Claude Code compatible output carries only `claude_code.*` events, not omp's own log stream.
+		if (!claudeCompat) {
+			unregisterLogSink = logger.registerLogSink(event => {
+				emitOtelLog(event.level, event.message, logAttributesFromContext(event.context), "omp.log", event.timestamp);
+			});
+		}
+	}
+
+	if (claudeCompat) {
+		compatRecorder = new ClaudeCodeCompatRecorder(
+			metrics.getMeter("com.anthropic.claude_code"),
+			logs.getLogger("com.anthropic.claude_code.events"),
+		);
 	}
 
 	const flushTimer = setInterval(() => {
@@ -201,8 +233,19 @@ export async function registerProviders(signalConfig: TelemetrySignalConfig): Pr
 		if (traceProvider) shutdowns.push(traceProvider.shutdown());
 		if (logProvider) shutdowns.push(logProvider.shutdown());
 		if (meterProvider) shutdowns.push(meterProvider.shutdown());
-		await Promise.all(shutdowns);
+		await settleExports("shutdown", shutdowns);
 	});
+}
+
+/**
+ * Telemetry export is best-effort: a rejecting collector (e.g. 401) must not
+ * abort the caller — print mode's terminal-failure flush, or the postmortem
+ * handler, which would otherwise surface it as an uncaught exception.
+ */
+async function settleExports(operation: string, pending: Promise<void>[]): Promise<void> {
+	for (const result of await Promise.allSettled(pending)) {
+		if (result.status === "rejected") logger.warn(`OTEL export ${operation} failed`, { err: result.reason });
+	}
 }
 
 class AgentMetricRecorder {
@@ -445,5 +488,5 @@ export async function flushTelemetryExport(): Promise<void> {
 	if (traceProvider) flushes.push(traceProvider.forceFlush());
 	if (logProvider) flushes.push(logProvider.forceFlush());
 	if (meterProvider) flushes.push(meterProvider.forceFlush());
-	await Promise.all(flushes);
+	await settleExports("flush", flushes);
 }
